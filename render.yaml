@@ -2,7 +2,7 @@ services:
   - type: web
     name: tennis-vortex-api
     runtime: python
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install --prefer-binary -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     plan: free
     envVars:
@@ -18,6 +18,8 @@ services:
         value: https://astonishing-travesseiro-141d6f.netlify.app
       - key: ENVIRONMENT
         value: production
+      - key: PYTHON_VERSION
+        value: "3.11.9"
     healthCheckPath: /health
 
 databases:
