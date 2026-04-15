@@ -256,4 +256,4 @@ class SyncLog(Base):
     duration_seconds = mapped_column(Float)
     started_at = mapped_column(DateTime, server_default=func.now(), index=True)
     completed_at = mapped_column(DateTime)
-    metadata = mapped_column(JSON)
+    extra_data = mapped_column(JSON)
