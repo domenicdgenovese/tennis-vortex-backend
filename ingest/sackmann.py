@@ -70,7 +70,7 @@ async def sync_players(db: AsyncSession) -> dict:
     if df is None:
         return stats
 
-    # Columns: player_id, name_first, name_last, hand, dob, country_code, height, wikidata_id
+    # Columns: player_id, name_first, name_last, hand, dob, ioc, height, wikidata_id
     for _, row in df.iterrows():
         stats["processed"] += 1
         pid = str(int(row["player_id"])) if pd.notna(row["player_id"]) else None
@@ -85,7 +85,9 @@ async def sync_players(db: AsyncSession) -> dict:
             except:
                 pass
 
-        cc = str(row.get("country_code", "")).strip().upper()[:3] if pd.notna(row.get("country_code")) else None
+        # Sackmann uses "ioc" for the 3-letter country code (not "country_code")
+        raw_cc = row.get("ioc") or row.get("country_code")
+        cc = str(raw_cc).strip().upper()[:3] if pd.notna(raw_cc) else None
 
         player_data = {
             "id": pid,
@@ -128,7 +130,9 @@ async def sync_rankings(db: AsyncSession) -> dict:
 
     for _, row in df.iterrows():
         stats["processed"] += 1
-        pid = str(int(row["player_id"])) if pd.notna(row["player_id"]) else None
+        # Sackmann's rankings CSVs use "player" (not "player_id") as the column name
+        raw_pid = row.get("player") if "player" in df.columns else row.get("player_id")
+        pid = str(int(raw_pid)) if pd.notna(raw_pid) else None
         if not pid:
             continue
 
@@ -160,8 +164,8 @@ async def sync_matches(db: AsyncSession, year: int) -> dict:
     stats = {"processed": 0, "inserted": 0, "updated": 0}
 
     async with httpx.AsyncClient() as client:
+        # Stats are embedded in the main match CSV (columns: w_ace, w_df, w_svpt, etc.)
         matches_df = await fetch_csv(f"{BASE_URL}/atp_matches_{year}.csv", client)
-        stats_df = await fetch_csv(f"{BASE_URL}/atp_matches_stats_{year}.csv", client)
 
     if matches_df is None:
         logger.warning(f"No match data for {year}")
@@ -235,6 +239,38 @@ async def sync_matches(db: AsyncSession, year: int) -> dict:
             )
             await db.execute(stmt)
             stats["inserted"] += 1
+
+            # Populate MatchStats from in-line columns (w_ace, w_df, w_svpt, etc.)
+            # Only insert when at least one stat is present
+            if any(pd.notna(row.get(c)) for c in ("w_ace", "w_df", "w_svpt")):
+                ms_data = {
+                    "match_id": match_id,
+                    "w_aces":          safe_int(row.get("w_ace")),
+                    "w_double_faults": safe_int(row.get("w_df")),
+                    "w_serve_pts":     safe_int(row.get("w_svpt")),
+                    "w_first_in":      safe_int(row.get("w_1stIn")),
+                    "w_first_won":     safe_int(row.get("w_1stWon")),
+                    "w_second_won":    safe_int(row.get("w_2ndWon")),
+                    "w_serve_games":   safe_int(row.get("w_SvGms")),
+                    "w_break_pts_saved": safe_int(row.get("w_bpSaved")),
+                    "w_break_pts_faced": safe_int(row.get("w_bpFaced")),
+                    "l_aces":          safe_int(row.get("l_ace")),
+                    "l_double_faults": safe_int(row.get("l_df")),
+                    "l_serve_pts":     safe_int(row.get("l_svpt")),
+                    "l_first_in":      safe_int(row.get("l_1stIn")),
+                    "l_first_won":     safe_int(row.get("l_1stWon")),
+                    "l_second_won":    safe_int(row.get("l_2ndWon")),
+                    "l_serve_games":   safe_int(row.get("l_SvGms")),
+                    "l_break_pts_saved": safe_int(row.get("l_bpSaved")),
+                    "l_break_pts_faced": safe_int(row.get("l_bpFaced")),
+                }
+                from database.models import MatchStats
+                ms_stmt = pg_insert(MatchStats).values(**ms_data)
+                ms_stmt = ms_stmt.on_conflict_do_update(
+                    index_elements=["match_id"],
+                    set_={k: v for k, v in ms_data.items() if k != "match_id"}
+                )
+                await db.execute(ms_stmt)
 
         except Exception as e:
             logger.error(f"Error processing match row {idx}: {e}")
