@@ -60,7 +60,7 @@ async def fetch_csv(url: str, client: httpx.AsyncClient) -> Optional[pd.DataFram
 
 
 async def sync_players(db: AsyncSession) -> dict:
-    """Sync player profiles from Sackmann's atp_players.csv."""
+    """Sync player profiles from Sackmann's atp_players.csv (batched upserts)."""
     started = time.time()
     stats = {"processed": 0, "inserted": 0, "updated": 0}
 
@@ -69,6 +69,20 @@ async def sync_players(db: AsyncSession) -> dict:
 
     if df is None:
         return stats
+
+    BATCH = 500  # rows per INSERT ... ON CONFLICT batch
+    batch: list[dict] = []
+
+    async def _flush(rows: list[dict]) -> None:
+        if not rows:
+            return
+        stmt = pg_insert(Player).values(rows)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["id"],
+            set_={c: stmt.excluded[c] for c in rows[0] if c != "id"},
+        )
+        await db.execute(stmt)
+        await db.commit()
 
     # Columns: player_id, name_first, name_last, hand, dob, ioc, height, wikidata_id
     for _, row in df.iterrows():
@@ -89,7 +103,7 @@ async def sync_players(db: AsyncSession) -> dict:
         raw_cc = row.get("ioc") or row.get("country_code")
         cc = str(raw_cc).strip().upper()[:3] if pd.notna(raw_cc) else None
 
-        player_data = {
+        batch.append({
             "id": pid,
             "first_name": str(row.get("name_first", "")).strip() or None,
             "last_name": str(row.get("name_last", "")).strip() or None,
@@ -99,23 +113,20 @@ async def sync_players(db: AsyncSession) -> dict:
             "country_code": cc,
             "height_cm": safe_int(row.get("height")),
             "sackmann_id": safe_int(row.get("player_id")),
-        }
-
-        stmt = pg_insert(Player).values(**player_data)
-        stmt = stmt.on_conflict_do_update(
-            index_elements=["id"],
-            set_={k: v for k, v in player_data.items() if k != "id"}
-        )
-        await db.execute(stmt)
+        })
         stats["inserted"] += 1
 
-    await db.commit()
-    logger.info(f"sync_players: {stats}")
+        if len(batch) >= BATCH:
+            await _flush(batch)
+            batch.clear()
+
+    await _flush(batch)
+    logger.info(f"sync_players: {stats} ({time.time()-started:.1f}s)")
     return stats
 
 
 async def sync_rankings(db: AsyncSession) -> dict:
-    """Sync current ATP rankings from Sackmann."""
+    """Sync current ATP rankings from Sackmann (batched upserts)."""
     started = time.time()
     stats = {"processed": 0, "inserted": 0, "updated": 0}
 
@@ -125,37 +136,36 @@ async def sync_rankings(db: AsyncSession) -> dict:
     if df is None:
         return stats
 
-    # Columns: ranking_date, rank, player_id, points
+    # Columns: ranking_date, rank, player (Sackmann uses "player" not "player_id")
     today = date.today()
+    player_col = "player" if "player" in df.columns else "player_id"
 
+    rows_to_insert: list[dict] = []
     for _, row in df.iterrows():
         stats["processed"] += 1
-        # Sackmann's rankings CSVs use "player" (not "player_id") as the column name
-        raw_pid = row.get("player") if "player" in df.columns else row.get("player_id")
+        raw_pid = row.get(player_col)
         pid = str(int(raw_pid)) if pd.notna(raw_pid) else None
         if not pid:
             continue
-
-        rank_date = today  # current rankings = today
-
-        ranking_data = {
+        rows_to_insert.append({
             "player_id": pid,
-            "ranking_date": rank_date,
+            "ranking_date": today,
             "rank": safe_int(row.get("rank")),
             "points": safe_int(row.get("points")),
             "tour": "ATP",
-        }
-
-        stmt = pg_insert(Ranking).values(**ranking_data)
-        stmt = stmt.on_conflict_do_update(
-            index_elements=["player_id", "ranking_date"],
-            set_={"rank": ranking_data["rank"], "points": ranking_data["points"]}
-        )
-        await db.execute(stmt)
+        })
         stats["inserted"] += 1
 
-    await db.commit()
-    logger.info(f"sync_rankings: {stats}")
+    if rows_to_insert:
+        stmt = pg_insert(Ranking).values(rows_to_insert)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["player_id", "ranking_date"],
+            set_={"rank": stmt.excluded.rank, "points": stmt.excluded.points},
+        )
+        await db.execute(stmt)
+        await db.commit()
+
+    logger.info(f"sync_rankings: {stats} ({time.time()-started:.1f}s)")
     return stats
 
 
@@ -171,16 +181,43 @@ async def sync_matches(db: AsyncSession, year: int) -> dict:
         logger.warning(f"No match data for {year}")
         return stats
 
-    tourns_seen = {}
+    from database.models import MatchStats
+
+    BATCH = 500
+    tourns_seen: dict = {}
+    match_batch: list[dict] = []
+    ms_batch: list[dict] = []
+
+    async def _flush_matches(rows: list[dict]) -> None:
+        if not rows:
+            return
+        stmt = pg_insert(Match).values(rows)
+        keys = [k for k in rows[0] if k not in ("tournament_id", "round", "winner_id", "loser_id")]
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["tournament_id", "round", "winner_id", "loser_id"],
+            set_={k: stmt.excluded[k] for k in keys if k != "id"},
+        )
+        await db.execute(stmt)
+        await db.commit()
+
+    async def _flush_stats(rows: list[dict]) -> None:
+        if not rows:
+            return
+        stmt = pg_insert(MatchStats).values(rows)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["match_id"],
+            set_={k: stmt.excluded[k] for k in rows[0] if k != "match_id"},
+        )
+        await db.execute(stmt)
+        await db.commit()
 
     for idx, row in matches_df.iterrows():
         stats["processed"] += 1
-
         try:
             tid = row.get("tourney_id", "")
             tid_str = f"{year}_{str(tid).replace(str(year)+'_','')}"
 
-            # Upsert tournament
+            # Upsert tournament (one at a time, but only once per tournament)
             if tid_str not in tourns_seen:
                 t_date = parse_sackmann_date(row.get("tourney_date"))
                 tourn_data = {
@@ -194,15 +231,14 @@ async def sync_matches(db: AsyncSession, year: int) -> dict:
                     "draw_size": safe_int(row.get("draw_size")),
                     "status": "completed" if t_date and t_date < date.today() else "upcoming",
                 }
-                stmt = pg_insert(Tournament).values(**tourn_data)
-                stmt = stmt.on_conflict_do_update(
+                t_stmt = pg_insert(Tournament).values(**tourn_data)
+                t_stmt = t_stmt.on_conflict_do_update(
                     index_elements=["id"],
                     set_={k: v for k, v in tourn_data.items() if k != "id"}
                 )
-                await db.execute(stmt)
+                await db.execute(t_stmt)
                 tourns_seen[tid_str] = True
 
-            # Match
             w_id = str(int(row["winner_id"])) if pd.notna(row.get("winner_id")) else None
             l_id = str(int(row["loser_id"])) if pd.notna(row.get("loser_id")) else None
             if not w_id or not l_id:
@@ -212,7 +248,7 @@ async def sync_matches(db: AsyncSession, year: int) -> dict:
             rnd = str(row.get("round", "")).strip()
             match_id = f"{tid_str}_{rnd}_{w_id}_{l_id}"
 
-            match_data = {
+            match_batch.append({
                 "id": match_id,
                 "tournament_id": tid_str,
                 "match_date": match_date,
@@ -230,20 +266,11 @@ async def sync_matches(db: AsyncSession, year: int) -> dict:
                 "score": str(row.get("score", "")).strip() or None,
                 "minutes": safe_int(row.get("minutes")),
                 "status": "completed",
-            }
-
-            stmt = pg_insert(Match).values(**match_data)
-            stmt = stmt.on_conflict_do_update(
-                index_elements=["tournament_id", "round", "winner_id", "loser_id"],
-                set_={k: v for k, v in match_data.items() if k not in ("id", "tournament_id", "round", "winner_id", "loser_id")}
-            )
-            await db.execute(stmt)
+            })
             stats["inserted"] += 1
 
-            # Populate MatchStats from in-line columns (w_ace, w_df, w_svpt, etc.)
-            # Only insert when at least one stat is present
             if any(pd.notna(row.get(c)) for c in ("w_ace", "w_df", "w_svpt")):
-                ms_data = {
+                ms_batch.append({
                     "match_id": match_id,
                     "w_aces":          safe_int(row.get("w_ace")),
                     "w_double_faults": safe_int(row.get("w_df")),
@@ -263,20 +290,21 @@ async def sync_matches(db: AsyncSession, year: int) -> dict:
                     "l_serve_games":   safe_int(row.get("l_SvGms")),
                     "l_break_pts_saved": safe_int(row.get("l_bpSaved")),
                     "l_break_pts_faced": safe_int(row.get("l_bpFaced")),
-                }
-                from database.models import MatchStats
-                ms_stmt = pg_insert(MatchStats).values(**ms_data)
-                ms_stmt = ms_stmt.on_conflict_do_update(
-                    index_elements=["match_id"],
-                    set_={k: v for k, v in ms_data.items() if k != "match_id"}
-                )
-                await db.execute(ms_stmt)
+                })
+
+            if len(match_batch) >= BATCH:
+                await _flush_matches(match_batch)
+                await _flush_stats(ms_batch)
+                match_batch.clear()
+                ms_batch.clear()
 
         except Exception as e:
             logger.error(f"Error processing match row {idx}: {e}")
+            await db.rollback()
             continue
 
-    await db.commit()
+    await _flush_matches(match_batch)
+    await _flush_stats(ms_batch)
     logger.info(f"sync_matches {year}: {stats}")
     return stats
 
