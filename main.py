@@ -36,21 +36,26 @@ async def lifespan(app: FastAPI):
     scheduler = setup_scheduler()
     logger.info("Scheduler running")
 
-    # Run initial data sync on first start (if DB is empty)
-    from database.connection import AsyncSessionLocal
-    from sqlalchemy import select, func
-    from database.models import Player
-    async with AsyncSessionLocal() as db:
-        count = await db.execute(select(func.count(Player.id)))
-        player_count = count.scalar()
-        if player_count == 0:
-            logger.info("Empty database -- running initial full sync...")
-            from ingest.sackmann import run_full_sync
-            try:
-                result = await run_full_sync(db)
-                logger.info(f"Initial sync complete: {result}")
-            except Exception as e:
-                logger.error(f"Initial sync failed (will retry via scheduler): {e}")
+    # Run initial data sync in the background so the health check can pass immediately
+    import asyncio
+
+    async def _initial_sync():
+        from database.connection import AsyncSessionLocal
+        from sqlalchemy import select, func
+        from database.models import Player
+        async with AsyncSessionLocal() as db:
+            count = await db.execute(select(func.count(Player.id)))
+            player_count = count.scalar()
+            if player_count == 0:
+                logger.info("Empty database — running initial full sync in background...")
+                from ingest.sackmann import run_full_sync
+                try:
+                    result = await run_full_sync(db)
+                    logger.info(f"Initial sync complete: {result}")
+                except Exception as e:
+                    logger.error(f"Initial sync failed (will retry via scheduler): {e}")
+
+    asyncio.create_task(_initial_sync())
 
     yield
 
