@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: tennis-vortex-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    plan: free
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: tennis-vortex-db
+          property: connectionString
+      - key: ODDS_API_KEY
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: FRONTEND_URL
+        value: https://astonishing-travesseiro-141d6f.netlify.app
+      - key: ENVIRONMENT
+        value: production
+    healthCheckPath: /health
+
+databases:
+  - name: tennis-vortex-db
+    plan: free
+    databaseName: tennis_vortex
+    ipAllowList: []
