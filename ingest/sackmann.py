@@ -22,6 +22,8 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master"
 
 CURRENT_YEAR = datetime.now().year
+# Sackmann publishes match files per year; load the last 3 completed years
+# (current year file may not exist yet — fetch_csv handles 404 gracefully)
 YEARS_TO_LOAD = [CURRENT_YEAR, CURRENT_YEAR - 1, CURRENT_YEAR - 2]
 
 # Surface normalization
@@ -60,67 +62,89 @@ async def fetch_csv(url: str, client: httpx.AsyncClient) -> Optional[pd.DataFram
 
 
 async def sync_players(db: AsyncSession) -> dict:
-    """Sync player profiles from Sackmann's atp_players.csv (batched upserts)."""
+    """
+    Sync player profiles for currently ranked players only.
+    Only ~1 500 rows vs 70 k historical — fast enough for every deploy.
+    """
     started = time.time()
     stats = {"processed": 0, "inserted": 0, "updated": 0}
 
     async with httpx.AsyncClient() as client:
-        df = await fetch_csv(f"{BASE_URL}/atp_players.csv", client)
+        players_df = await fetch_csv(f"{BASE_URL}/atp_players.csv", client)
+        rankings_df = await fetch_csv(f"{BASE_URL}/atp_rankings_current.csv", client)
 
-    if df is None:
+    if players_df is None:
         return stats
 
-    BATCH = 500  # rows per INSERT ... ON CONFLICT batch
-    batch: list[dict] = []
+    # Build set of player IDs that appear in current rankings
+    ranked_ids: set[str] = set()
+    if rankings_df is not None:
+        player_col = "player" if "player" in rankings_df.columns else "player_id"
+        for _, row in rankings_df.iterrows():
+            raw = row.get(player_col)
+            if pd.notna(raw):
+                ranked_ids.add(str(int(raw)))
 
-    async def _flush(rows: list[dict]) -> None:
-        if not rows:
-            return
-        stmt = pg_insert(Player).values(rows)
-        stmt = stmt.on_conflict_do_update(
-            index_elements=["id"],
-            set_={c: stmt.excluded[c] for c in rows[0] if c != "id"},
-        )
-        await db.execute(stmt)
-        await db.commit()
+    # Also collect player IDs from recent match years so surface records have data
+    async with httpx.AsyncClient() as client:
+        for yr in YEARS_TO_LOAD:
+            m_df = await fetch_csv(f"{BASE_URL}/atp_matches_{yr}.csv", client)
+            if m_df is not None:
+                for col in ("winner_id", "loser_id"):
+                    for v in m_df[col].dropna():
+                        ranked_ids.add(str(int(v)))
 
-    # Columns: player_id, name_first, name_last, hand, dob, ioc, height, wikidata_id
-    for _, row in df.iterrows():
+    # Now sync only those players (fast: typically < 5 000 unique IDs)
+    players_df = players_df[players_df["player_id"].apply(
+        lambda x: pd.notna(x) and str(int(x)) in ranked_ids
+    )]
+
+    rows_to_insert: list[dict] = []
+    for _, row in players_df.iterrows():
         stats["processed"] += 1
-        pid = str(int(row["player_id"])) if pd.notna(row["player_id"]) else None
-        if not pid:
-            continue
+        pid = str(int(row["player_id"]))
 
         dob = None
         if pd.notna(row.get("dob")) and str(row["dob"]).strip() not in ("", "nan", "0"):
             try:
                 dob_str = str(int(row["dob"])) if isinstance(row["dob"], float) else str(row["dob"])
                 dob = datetime.strptime(dob_str[:8], "%Y%m%d").date()
-            except:
+            except Exception:
                 pass
 
-        # Sackmann uses "ioc" for the 3-letter country code (not "country_code")
         raw_cc = row.get("ioc") or row.get("country_code")
         cc = str(raw_cc).strip().upper()[:3] if pd.notna(raw_cc) else None
 
-        batch.append({
+        rows_to_insert.append({
             "id": pid,
             "first_name": str(row.get("name_first", "")).strip() or None,
-            "last_name": str(row.get("name_last", "")).strip() or None,
+            "last_name":  str(row.get("name_last",  "")).strip() or None,
             "name": f"{str(row.get('name_first','')).strip()} {str(row.get('name_last','')).strip()}".strip(),
             "hand": str(row.get("hand", "")).strip()[:1].upper() or None,
             "dob": dob,
             "country_code": cc,
             "height_cm": safe_int(row.get("height")),
             "sackmann_id": safe_int(row.get("player_id")),
+            "is_active": True,
         })
         stats["inserted"] += 1
 
-        if len(batch) >= BATCH:
-            await _flush(batch)
-            batch.clear()
+    # Batch upsert (all rows in one statement — safe for ~5k rows)
+    if rows_to_insert:
+        BATCH = 500
+        for i in range(0, len(rows_to_insert), BATCH):
+            chunk = rows_to_insert[i:i + BATCH]
+            ins = pg_insert(Player).values(chunk)
+            ins = ins.on_conflict_do_update(
+                index_elements=["id"],
+                set_={
+                    col: getattr(ins.excluded, col)
+                    for col in chunk[0] if col != "id"
+                },
+            )
+            await db.execute(ins)
+        await db.commit()
 
-    await _flush(batch)
     logger.info(f"sync_players: {stats} ({time.time()-started:.1f}s)")
     return stats
 
@@ -192,10 +216,10 @@ async def sync_matches(db: AsyncSession, year: int) -> dict:
         if not rows:
             return
         stmt = pg_insert(Match).values(rows)
-        keys = [k for k in rows[0] if k not in ("tournament_id", "round", "winner_id", "loser_id")]
+        skip = {"id", "tournament_id", "round", "winner_id", "loser_id"}
         stmt = stmt.on_conflict_do_update(
             index_elements=["tournament_id", "round", "winner_id", "loser_id"],
-            set_={k: stmt.excluded[k] for k in keys if k != "id"},
+            set_={k: getattr(stmt.excluded, k) for k in rows[0] if k not in skip},
         )
         await db.execute(stmt)
         await db.commit()
@@ -206,7 +230,7 @@ async def sync_matches(db: AsyncSession, year: int) -> dict:
         stmt = pg_insert(MatchStats).values(rows)
         stmt = stmt.on_conflict_do_update(
             index_elements=["match_id"],
-            set_={k: stmt.excluded[k] for k in rows[0] if k != "match_id"},
+            set_={k: getattr(stmt.excluded, k) for k in rows[0] if k != "match_id"},
         )
         await db.execute(stmt)
         await db.commit()
