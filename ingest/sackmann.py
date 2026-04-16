@@ -245,6 +245,10 @@ async def sync_matches(db: AsyncSession, year: int) -> dict:
             tid_str = f"{year}_{str(tid).replace(str(year)+'_','')}"
 
             # Upsert tournament (one at a time, but only once per tournament)
+            # IMPORTANT: commit immediately so the tournament is always in the DB
+            # before any match row references it. A later rollback (for a bad
+            # match row) must NOT undo the tournament insert, otherwise matches
+            # that reference it will violate the FK constraint.
             if tid_str not in tourns_seen:
                 t_date = parse_sackmann_date(row.get("tourney_date"))
                 tourn_data = {
@@ -264,6 +268,7 @@ async def sync_matches(db: AsyncSession, year: int) -> dict:
                     set_={k: v for k, v in tourn_data.items() if k != "id"}
                 )
                 await db.execute(t_stmt)
+                await db.commit()  # eager commit — survives any later rollback
                 tourns_seen[tid_str] = True
 
             w_id = str(int(row["winner_id"])) if pd.notna(row.get("winner_id")) else None
@@ -327,7 +332,12 @@ async def sync_matches(db: AsyncSession, year: int) -> dict:
 
         except Exception as e:
             logger.error(f"Error processing match row {idx}: {e}")
-            await db.rollback()
+            try:
+                await db.rollback()  # recover session from error state
+            except Exception:
+                pass
+            match_batch.clear()  # discard the failed batch so we don't retry it
+            ms_batch.clear()
             continue
 
     await _flush_matches(match_batch)
