@@ -156,8 +156,10 @@ async def sync_rankings(db: AsyncSession) -> dict:
     df = df[df["ranking_date_parsed"] == latest_date].copy()
     rank_date = latest_date.date() if pd.notna(latest_date) else date.today()
 
-    # Build insert rows
+    # Build insert rows — deduplicate by player (keep lowest rank per player)
     valid = df[pd.to_numeric(df[player_col], errors="coerce").notna()].copy()
+    valid["rank_num"] = pd.to_numeric(valid["rank"], errors="coerce")
+    valid = valid.sort_values("rank_num").drop_duplicates(subset=[player_col], keep="first")
     stats["processed"] = len(valid)
 
     rows_to_insert = [
