@@ -63,41 +63,30 @@ async def fetch_csv(url: str, client: httpx.AsyncClient) -> Optional[pd.DataFram
 
 async def sync_players(db: AsyncSession) -> dict:
     """
-    Sync player profiles for currently ranked players only.
-    Only ~1 500 rows vs 70 k historical — fast enough for every deploy.
+    Sync player profiles from match participants only (~5k rows, fast).
+    Uses 2024 match CSV to find active player IDs rather than all 70k historical players.
     """
     started = time.time()
     stats = {"processed": 0, "inserted": 0, "updated": 0}
 
     async with httpx.AsyncClient() as client:
         players_df = await fetch_csv(f"{BASE_URL}/atp_players.csv", client)
-        rankings_df = await fetch_csv(f"{BASE_URL}/atp_rankings_current.csv", client)
-
-    if players_df is None:
-        return stats
-
-    # Build set of player IDs that appear in current rankings
-    ranked_ids: set[str] = set()
-    if rankings_df is not None:
-        player_col = "player" if "player" in rankings_df.columns else "player_id"
-        for _, row in rankings_df.iterrows():
-            raw = row.get(player_col)
-            if pd.notna(raw):
-                ranked_ids.add(str(int(raw)))
-
-    # Also collect player IDs from recent match years so surface records have data
-    async with httpx.AsyncClient() as client:
+        # Collect player IDs from recent match years (small CSVs)
+        match_player_ids: set[str] = set()
         for yr in YEARS_TO_LOAD:
             m_df = await fetch_csv(f"{BASE_URL}/atp_matches_{yr}.csv", client)
             if m_df is not None:
                 for col in ("winner_id", "loser_id"):
-                    for v in m_df[col].dropna():
-                        ranked_ids.add(str(int(v)))
+                    valid = m_df[col].dropna()
+                    match_player_ids.update(str(int(v)) for v in valid)
 
-    # Now sync only those players (fast: typically < 5 000 unique IDs)
-    players_df = players_df[players_df["player_id"].apply(
-        lambda x: pd.notna(x) and str(int(x)) in ranked_ids
-    )]
+    if players_df is None or not match_player_ids:
+        return stats
+
+    # Vectorized filter — fast on 70k rows
+    pid_series = players_df["player_id"].dropna().astype(int).astype(str)
+    mask = pid_series.isin(match_player_ids)
+    players_df = players_df[mask.values]
 
     rows_to_insert: list[dict] = []
     for _, row in players_df.iterrows():
@@ -129,20 +118,16 @@ async def sync_players(db: AsyncSession) -> dict:
         })
         stats["inserted"] += 1
 
-    # Batch upsert (all rows in one statement — safe for ~5k rows)
+    BATCH = 500
+    for i in range(0, len(rows_to_insert), BATCH):
+        chunk = rows_to_insert[i:i + BATCH]
+        ins = pg_insert(Player).values(chunk)
+        ins = ins.on_conflict_do_update(
+            index_elements=["id"],
+            set_={col: getattr(ins.excluded, col) for col in chunk[0] if col != "id"},
+        )
+        await db.execute(ins)
     if rows_to_insert:
-        BATCH = 500
-        for i in range(0, len(rows_to_insert), BATCH):
-            chunk = rows_to_insert[i:i + BATCH]
-            ins = pg_insert(Player).values(chunk)
-            ins = ins.on_conflict_do_update(
-                index_elements=["id"],
-                set_={
-                    col: getattr(ins.excluded, col)
-                    for col in chunk[0] if col != "id"
-                },
-            )
-            await db.execute(ins)
         await db.commit()
 
     logger.info(f"sync_players: {stats} ({time.time()-started:.1f}s)")
@@ -150,7 +135,10 @@ async def sync_players(db: AsyncSession) -> dict:
 
 
 async def sync_rankings(db: AsyncSession) -> dict:
-    """Sync current ATP rankings from Sackmann (batched upserts)."""
+    """
+    Sync current ATP rankings — only the LATEST ranking date (~1 500 rows).
+    atp_rankings_current.csv has 92k rows (weekly history); we keep only the newest.
+    """
     started = time.time()
     stats = {"processed": 0, "inserted": 0, "updated": 0}
 
@@ -160,27 +148,32 @@ async def sync_rankings(db: AsyncSession) -> dict:
     if df is None:
         return stats
 
-    # Columns: ranking_date, rank, player (Sackmann uses "player" not "player_id")
-    today = date.today()
     player_col = "player" if "player" in df.columns else "player_id"
 
-    rows_to_insert: list[dict] = []
-    for _, row in df.iterrows():
-        stats["processed"] += 1
-        raw_pid = row.get(player_col)
-        pid = str(int(raw_pid)) if pd.notna(raw_pid) else None
-        if not pid:
-            continue
-        rows_to_insert.append({
-            "player_id": pid,
-            "ranking_date": today,
+    # Keep only the most-recent ranking date (vectorised, no iterrows)
+    df["ranking_date_parsed"] = pd.to_datetime(df["ranking_date"], format="%Y%m%d", errors="coerce")
+    latest_date = df["ranking_date_parsed"].max()
+    df = df[df["ranking_date_parsed"] == latest_date].copy()
+    rank_date = latest_date.date() if pd.notna(latest_date) else date.today()
+
+    # Build insert rows
+    valid = df[pd.to_numeric(df[player_col], errors="coerce").notna()].copy()
+    stats["processed"] = len(valid)
+
+    rows_to_insert = [
+        {
+            "player_id": str(int(row[player_col])),
+            "ranking_date": rank_date,
             "rank": safe_int(row.get("rank")),
             "points": safe_int(row.get("points")),
             "tour": "ATP",
-        })
-        stats["inserted"] += 1
+        }
+        for _, row in valid.iterrows()
+    ]
+    stats["inserted"] = len(rows_to_insert)
 
     if rows_to_insert:
+        # Single batch (≤2000 rows)
         stmt = pg_insert(Ranking).values(rows_to_insert)
         stmt = stmt.on_conflict_do_update(
             index_elements=["player_id", "ranking_date"],
@@ -189,7 +182,15 @@ async def sync_rankings(db: AsyncSession) -> dict:
         await db.execute(stmt)
         await db.commit()
 
-    logger.info(f"sync_rankings: {stats} ({time.time()-started:.1f}s)")
+        # Also mark those players as active in the players table
+        pids = [r["player_id"] for r in rows_to_insert]
+        from sqlalchemy import update as sa_update
+        await db.execute(
+            sa_update(Player).where(Player.id.in_(pids)).values(is_active=True)
+        )
+        await db.commit()
+
+    logger.info(f"sync_rankings: {stats} latest_date={rank_date} ({time.time()-started:.1f}s)")
     return stats
 
 
