@@ -83,10 +83,10 @@ async def sync_players(db: AsyncSession) -> dict:
     if players_df is None or not match_player_ids:
         return stats
 
-    # Vectorized filter — fast on 70k rows
-    pid_series = players_df["player_id"].dropna().astype(int).astype(str)
-    mask = pid_series.isin(match_player_ids)
-    players_df = players_df[mask.values]
+    # Vectorized filter using pd.to_numeric (NaN → -1 → never in set) preserving index alignment
+    pid_as_str = pd.to_numeric(players_df["player_id"], errors="coerce").fillna(-1).astype(int).astype(str)
+    mask = pid_as_str.isin(match_player_ids)  # same length as players_df
+    players_df = players_df[mask]
 
     rows_to_insert: list[dict] = []
     for _, row in players_df.iterrows():
@@ -486,13 +486,21 @@ async def compute_h2h(db: AsyncSession) -> dict:
 
 async def run_full_sync(db: AsyncSession) -> dict:
     """Run all Sackmann sync jobs in order."""
+    from database.connection import AsyncSessionLocal
+
+    # Use a SEPARATE session just for the SyncLog so DB errors in sync
+    # don't prevent the log from being updated (avoids "still running" ghosts).
+    async with AsyncSessionLocal() as log_db:
+        log = SyncLog(job_name="sackmann_full_sync", status="running")
+        log_db.add(log)
+        await log_db.commit()
+        await log_db.refresh(log)
+        log_id = log.id
+
     results = {}
-
-    log = SyncLog(job_name="sackmann_full_sync", status="running")
-    db.add(log)
-    await db.commit()
-
     started = time.time()
+    error_msg: str | None = None
+
     try:
         results["players"] = await sync_players(db)
         results["rankings"] = await sync_rankings(db)
@@ -503,16 +511,25 @@ async def run_full_sync(db: AsyncSession) -> dict:
         results["surface_records"] = await compute_surface_records(db)
         results["h2h"] = await compute_h2h(db)
 
-        log.status = "success"
-        log.records_processed = sum(r.get("processed", 0) for r in results.values() if isinstance(r, dict))
-        log.records_inserted = sum(r.get("inserted", 0) for r in results.values() if isinstance(r, dict))
     except Exception as e:
-        log.status = "failed"
-        log.error_message = str(e)
-        logger.error(f"Full sync failed: {e}")
-    finally:
-        log.duration_seconds = time.time() - started
-        log.completed_at = datetime.now()
-        await db.commit()
+        error_msg = str(e)
+        logger.error(f"Full sync failed: {e}", exc_info=True)
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+
+    # Update the SyncLog via a fresh session — always succeeds
+    async with AsyncSessionLocal() as log_db:
+        log_row = await log_db.get(SyncLog, log_id)
+        if log_row:
+            log_row.status = "failed" if error_msg else "success"
+            log_row.error_message = error_msg
+            log_row.duration_seconds = time.time() - started
+            log_row.completed_at = datetime.now()
+            if not error_msg:
+                log_row.records_processed = sum(r.get("processed", 0) for r in results.values() if isinstance(r, dict))
+                log_row.records_inserted = sum(r.get("inserted", 0) for r in results.values() if isinstance(r, dict))
+            await log_db.commit()
 
     return results
