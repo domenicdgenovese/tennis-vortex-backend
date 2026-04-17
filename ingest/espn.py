@@ -63,11 +63,10 @@ async def sync_espn_rankings(db: AsyncSession) -> dict:
         rank_date = date.today()
 
     # Build name → player_id lookup from our existing players
-    existing = await db.execute(select(Player.id, Player.name, Player.atp_code))
+    existing_res = await db.execute(select(Player.id, Player.name, Player.atp_code))
     name_to_id: dict[str, str] = {}   # normalised_name → player_id
     espn_id_to_id: dict[str, str] = {}  # espn_id (str) → player_id
-    for row in existing:
-        pid, pname, atp_code = row
+    for pid, pname, atp_code in existing_res.all():
         if pname:
             name_to_id[_norm_name(pname)] = pid
         if atp_code and atp_code.startswith("e"):
