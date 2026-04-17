@@ -236,10 +236,18 @@ async def get_player(player_id: str, db: AsyncSession = Depends(get_db)):
     ranking = rk_res.scalar_one_or_none()
 
     year = datetime.now().year
+    # Prefer current-year records; fall back to all available years if none exist
     sr_res = await db.execute(select(PlayerSurfaceRecord).where(
-        and_(PlayerSurfaceRecord.player_id==player_id, PlayerSurfaceRecord.year==year)
+        PlayerSurfaceRecord.player_id == player_id
     ))
-    surface_records = sr_res.scalars().all()
+    all_surface_records = sr_res.scalars().all()
+    # Group by surface, aggregate wins/losses across all years
+    from collections import defaultdict
+    surf_agg: dict = defaultdict(lambda: {"wins": 0, "losses": 0})
+    for r in all_surface_records:
+        surf_agg[r.surface]["wins"] += r.wins or 0
+        surf_agg[r.surface]["losses"] += r.losses or 0
+    surface_records = surf_agg  # dict of surface -> {wins, losses}
 
     match_res = await db.execute(
         select(Match).where(
@@ -264,10 +272,10 @@ async def get_player(player_id: str, db: AsyncSession = Depends(get_db)):
         "rank": ranking.rank if ranking else None,
         "points": ranking.points if ranking else None,
         "surface_records": {
-            r.surface: {
-                "wins": r.wins, "losses": r.losses,
-                "win_pct": round(r.wins/(r.wins+r.losses)*100,1) if (r.wins+r.losses)>0 else 0
-            } for r in surface_records
+            surf: {
+                "wins": v["wins"], "losses": v["losses"],
+                "win_pct": round(v["wins"]/(v["wins"]+v["losses"])*100, 1) if (v["wins"]+v["losses"]) > 0 else 0
+            } for surf, v in surface_records.items()
         },
         "recent_matches": [
             {
