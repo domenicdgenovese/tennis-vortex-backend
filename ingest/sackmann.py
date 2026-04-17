@@ -621,7 +621,9 @@ async def run_full_sync(db: AsyncSession) -> dict:
 
     try:
         results["players"] = await sync_players(db)
-        results["rankings"] = await sync_rankings(db)
+        # Use ESPN for current live rankings (Sackmann only has historical/end-of-season)
+        from ingest.espn import sync_espn_rankings
+        results["rankings"] = await sync_espn_rankings(db)
 
         for year in YEARS_TO_LOAD:
             results[f"matches_{year}"] = await sync_matches(db, year)

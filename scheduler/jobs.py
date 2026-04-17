@@ -29,8 +29,10 @@ async def _run_with_db(coro_fn, job_name: str):
 # -- HOURLY JOBS -------------------------------------------------------------
 
 async def job_sync_rankings():
-    from ingest.sackmann import sync_rankings
-    await _run_with_db(sync_rankings, "hourly_rankings")
+    # Use ESPN for live/current rankings (updated weekly by ESPN).
+    # Sackmann's rankings CSV is only updated through end-of-season.
+    from ingest.espn import sync_espn_rankings
+    await _run_with_db(sync_espn_rankings, "hourly_rankings")
 
 async def job_sync_live_scores():
     from ingest.espn import sync_live_scores

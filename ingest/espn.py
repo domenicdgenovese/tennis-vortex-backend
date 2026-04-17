@@ -1,22 +1,154 @@
 """
-ESPN unofficial API ingestion for live scores and upcoming matches.
+ESPN unofficial API ingestion for live scores, upcoming matches,
+and current ATP rankings.
 No authentication required.
 """
 
 import logging
+import re
 import time
+import unicodedata
 from datetime import datetime, date
 from typing import Optional, List, Dict
 import httpx
+from sqlalchemy import select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from database.models import Match, Tournament, SyncLog
+from database.models import Match, Tournament, Player, Ranking, SyncLog
 from utils.helpers import safe_int, normalize_surface
 
 logger = logging.getLogger(__name__)
 
 ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports/tennis"
+ESPN_RANKINGS_URL = f"{ESPN_BASE}/atp/rankings"
 TOURS = ["atp", "wta"]
+
+
+def _norm_name(name: str) -> str:
+    """Lowercase, strip diacritics, collapse whitespace — for fuzzy matching."""
+    nfkd = unicodedata.normalize("NFKD", name)
+    ascii_str = nfkd.encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"\s+", " ", ascii_str).strip().lower()
+
+
+async def sync_espn_rankings(db: AsyncSession) -> dict:
+    """
+    Fetch live ATP rankings from ESPN and write them to the rankings table.
+    ESPN updates weekly (usually Monday). Uses today's date as ranking_date.
+    For players not yet in our DB, inserts a minimal Player record using
+    'e{espn_id}' as the primary key to avoid collision with Sackmann IDs.
+    """
+    started = time.time()
+    stats = {"processed": 0, "inserted": 0, "updated": 0, "new_players": 0}
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        try:
+            resp = await client.get(ESPN_RANKINGS_URL)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            logger.error(f"ESPN rankings fetch error: {e}")
+            return stats
+
+    ranks = data.get("rankings", [{}])[0].get("ranks", [])
+    if not ranks:
+        logger.warning("ESPN rankings: empty response")
+        return stats
+
+    # Parse the update date from ESPN (e.g. "2026-04-09T07:00Z")
+    update_str = data.get("rankings", [{}])[0].get("update", "")
+    try:
+        rank_date = datetime.fromisoformat(update_str.replace("Z", "+00:00")).date()
+    except Exception:
+        rank_date = date.today()
+
+    # Build name → player_id lookup from our existing players
+    existing = await db.execute(select(Player.id, Player.name, Player.atp_code))
+    name_to_id: dict[str, str] = {}   # normalised_name → player_id
+    espn_id_to_id: dict[str, str] = {}  # espn_id (str) → player_id
+    for row in existing:
+        pid, pname, atp_code = row
+        if pname:
+            name_to_id[_norm_name(pname)] = pid
+        if atp_code and atp_code.startswith("e"):
+            espn_id_to_id[atp_code[1:]] = pid  # strip 'e' prefix
+
+    rows_to_insert: list[dict] = []
+
+    for rank_entry in ranks:
+        stats["processed"] += 1
+        athlete = rank_entry.get("athlete", {})
+        espn_id = str(athlete.get("id", ""))
+        display_name = athlete.get("displayName", "").strip()
+        rank_num = rank_entry.get("current")
+        points = int(rank_entry.get("points", 0) or 0)
+
+        if not espn_id or not display_name or not rank_num:
+            continue
+
+        # Resolve to our player_id
+        player_id = (
+            espn_id_to_id.get(espn_id)          # already matched by ESPN id
+            or name_to_id.get(_norm_name(display_name))  # match by name
+        )
+
+        if player_id is None:
+            # New player — insert minimal record with ESPN-prefixed id
+            player_id = f"e{espn_id}"
+            parts = display_name.rsplit(" ", 1)
+            first = parts[0] if len(parts) == 2 else ""
+            last = parts[-1]
+            country_abbr = athlete.get("flag", {}).get("alt") or athlete.get("citizenship", "")
+            new_player = {
+                "id": player_id,
+                "name": display_name,
+                "first_name": first,
+                "last_name": last,
+                "country_code": country_abbr[:3].upper() if country_abbr else None,
+                "atp_code": f"e{espn_id}",   # mark as ESPN-sourced
+                "is_active": True,
+            }
+            p_stmt = pg_insert(Player).values(**new_player)
+            p_stmt = p_stmt.on_conflict_do_update(
+                index_elements=["id"],
+                set_={"name": display_name, "is_active": True}
+            )
+            await db.execute(p_stmt)
+            stats["new_players"] += 1
+            name_to_id[_norm_name(display_name)] = player_id
+            espn_id_to_id[espn_id] = player_id
+        else:
+            # Update atp_code to store ESPN id for future fast lookups
+            await db.execute(
+                sa_update(Player)
+                .where(Player.id == player_id)
+                .values(atp_code=f"e{espn_id}", is_active=True)
+            )
+
+        rows_to_insert.append({
+            "player_id": player_id,
+            "ranking_date": rank_date,
+            "rank": rank_num,
+            "points": points,
+            "tour": "ATP",
+        })
+
+    if rows_to_insert:
+        await db.commit()  # flush player upserts first
+        stmt = pg_insert(Ranking).values(rows_to_insert)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["player_id", "ranking_date"],
+            set_={"rank": stmt.excluded.rank, "points": stmt.excluded.points},
+        )
+        await db.execute(stmt)
+        await db.commit()
+        stats["inserted"] = len(rows_to_insert)
+
+    logger.info(
+        f"sync_espn_rankings: {stats} rank_date={rank_date} "
+        f"({time.time()-started:.1f}s)"
+    )
+    return stats
 
 
 async def fetch_espn_scoreboard(tour: str = "atp") -> Optional[Dict]:

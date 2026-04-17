@@ -143,7 +143,7 @@ async def trigger_sync(job: str = "full"):
 
     job_map = {
         "full": "ingest.sackmann.run_full_sync",
-        "rankings": "ingest.sackmann.sync_rankings",
+        "rankings": "ingest.espn.sync_espn_rankings",
         "players": "ingest.sackmann.sync_players",
         "odds": "ingest.odds.sync_odds",
         "live": "ingest.espn.sync_live_scores",
