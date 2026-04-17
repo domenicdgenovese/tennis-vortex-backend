@@ -469,6 +469,77 @@ async def compute_surface_records(db: AsyncSession) -> dict:
     """)
     await db.execute(sql)
 
+    # Also compute career (year=NULL) aggregates so the stats endpoint
+    # can show meaningful data even when the current year has no matches yet.
+    career_sql = text("""
+        WITH wl AS (
+            SELECT winner_id AS player_id, surface, m.id AS match_id, TRUE AS is_winner
+            FROM matches m WHERE status = 'completed' AND match_date IS NOT NULL
+            UNION ALL
+            SELECT loser_id, surface, m.id, FALSE
+            FROM matches m WHERE status = 'completed' AND match_date IS NOT NULL
+        ),
+        career_stats AS (
+            SELECT wl.player_id, wl.surface,
+                   SUM(CASE WHEN wl.is_winner THEN 1 ELSE 0 END) AS wins,
+                   SUM(CASE WHEN NOT wl.is_winner THEN 1 ELSE 0 END) AS losses,
+                   AVG(CASE WHEN wl.is_winner THEN ms.w_aces ELSE ms.l_aces END) AS avg_aces,
+                   AVG(CASE WHEN wl.is_winner THEN ms.w_double_faults ELSE ms.l_double_faults END) AS avg_dfs,
+                   AVG(CASE WHEN wl.is_winner AND ms.w_serve_pts > 0
+                        THEN 100.0 * ms.w_first_in / ms.w_serve_pts
+                        WHEN NOT wl.is_winner AND ms.l_serve_pts > 0
+                        THEN 100.0 * ms.l_first_in / ms.l_serve_pts
+                        ELSE NULL END) AS avg_first_in_pct,
+                   AVG(CASE WHEN wl.is_winner AND ms.w_first_in > 0
+                        THEN 100.0 * ms.w_first_won / ms.w_first_in
+                        WHEN NOT wl.is_winner AND ms.l_first_in > 0
+                        THEN 100.0 * ms.l_first_won / ms.l_first_in
+                        ELSE NULL END) AS avg_first_won_pct,
+                   AVG(CASE WHEN wl.is_winner AND (ms.w_serve_pts - ms.w_first_in) > 0
+                        THEN 100.0 * ms.w_second_won / (ms.w_serve_pts - ms.w_first_in)
+                        WHEN NOT wl.is_winner AND (ms.l_serve_pts - ms.l_first_in) > 0
+                        THEN 100.0 * ms.l_second_won / (ms.l_serve_pts - ms.l_first_in)
+                        ELSE NULL END) AS avg_second_won_pct,
+                   AVG(CASE WHEN wl.is_winner AND ms.w_serve_games > 0
+                        THEN 100.0 * (ms.w_serve_games - ms.w_break_pts_faced) / ms.w_serve_games
+                        WHEN NOT wl.is_winner AND ms.l_serve_games > 0
+                        THEN 100.0 * (ms.l_serve_games - ms.l_break_pts_faced) / ms.l_serve_games
+                        ELSE NULL END) AS avg_hold_pct,
+                   AVG(CASE WHEN wl.is_winner AND ms.l_break_pts_faced > 0
+                        THEN 100.0 * (ms.l_break_pts_faced - ms.l_break_pts_saved) / ms.l_break_pts_faced
+                        WHEN NOT wl.is_winner AND ms.w_break_pts_faced > 0
+                        THEN 100.0 * (ms.w_break_pts_faced - ms.w_break_pts_saved) / ms.w_break_pts_faced
+                        ELSE NULL END) AS avg_break_pct,
+                   AVG(CASE WHEN wl.is_winner AND ms.l_serve_pts > 0
+                        THEN 100.0 - 100.0 * (COALESCE(ms.l_first_won,0) + COALESCE(ms.l_second_won,0))::float / ms.l_serve_pts
+                        WHEN NOT wl.is_winner AND ms.w_serve_pts > 0
+                        THEN 100.0 - 100.0 * (COALESCE(ms.w_first_won,0) + COALESCE(ms.w_second_won,0))::float / ms.w_serve_pts
+                        ELSE NULL END) AS avg_return_pts_won_pct
+            FROM wl
+            LEFT JOIN match_stats ms ON ms.match_id = wl.match_id
+            GROUP BY wl.player_id, wl.surface
+        )
+        INSERT INTO player_surface_records
+            (player_id, surface, year, wins, losses,
+             avg_aces, avg_dfs, avg_first_in_pct, avg_first_won_pct,
+             avg_second_won_pct, avg_hold_pct, avg_break_pct, avg_return_pts_won_pct)
+        SELECT player_id, surface, NULL, wins, losses,
+               avg_aces, avg_dfs, avg_first_in_pct, avg_first_won_pct,
+               avg_second_won_pct, avg_hold_pct, avg_break_pct, avg_return_pts_won_pct
+        FROM career_stats
+        ON CONFLICT (player_id, surface, year)
+        DO UPDATE SET
+            wins = EXCLUDED.wins, losses = EXCLUDED.losses,
+            avg_aces = EXCLUDED.avg_aces, avg_dfs = EXCLUDED.avg_dfs,
+            avg_first_in_pct = EXCLUDED.avg_first_in_pct,
+            avg_first_won_pct = EXCLUDED.avg_first_won_pct,
+            avg_second_won_pct = EXCLUDED.avg_second_won_pct,
+            avg_hold_pct = EXCLUDED.avg_hold_pct,
+            avg_break_pct = EXCLUDED.avg_break_pct,
+            avg_return_pts_won_pct = EXCLUDED.avg_return_pts_won_pct,
+            updated_at = NOW()
+    """)
+    await db.execute(career_sql)
     await db.commit()
     return stats
 

@@ -76,7 +76,7 @@ async def get_player_stats(player_id: str, db: AsyncSession = Depends(get_db)):
     )
     surface_recs: dict = {r.surface.lower(): r for r in yr_res.scalars().all()}
 
-    # Always supplement with career records for any surface not yet covered
+    # Supplement with career records (year=NULL) for any surface not yet covered
     career_res = await db.execute(
         select(PlayerSurfaceRecord).where(
             and_(PlayerSurfaceRecord.player_id == player_id,
@@ -86,6 +86,19 @@ async def get_player_stats(player_id: str, db: AsyncSession = Depends(get_db)):
     for r in career_res.scalars().all():
         if r.surface.lower() not in surface_recs:
             surface_recs[r.surface.lower()] = r
+
+    # Last resort: fall back to the most recent year that HAS data
+    # (needed when current year and career records don't exist yet)
+    if not surface_recs:
+        fallback_res = await db.execute(
+            select(PlayerSurfaceRecord).where(
+                PlayerSurfaceRecord.player_id == player_id
+            ).order_by(desc(PlayerSurfaceRecord.year.nullslast()))
+        )
+        for r in fallback_res.scalars().all():
+            surf = r.surface.lower()
+            if surf not in surface_recs:
+                surface_recs[surf] = r
 
     def win_pct(surf: str) -> float:
         r = surface_recs.get(surf)
