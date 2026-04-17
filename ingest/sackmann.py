@@ -88,6 +88,24 @@ async def sync_players(db: AsyncSession) -> dict:
     mask = pid_as_str.isin(match_player_ids)  # same length as players_df
     players_df = players_df[mask]
 
+    # Any match participant not in atp_players.csv needs a placeholder so
+    # the FK constraint on matches(winner_id/loser_id) → players(id) is satisfied.
+    known_ids = set(pid_as_str[mask].tolist())
+    missing_ids = match_player_ids - known_ids
+    if missing_ids:
+        logger.info(f"sync_players: inserting {len(missing_ids)} placeholder rows for players missing from atp_players.csv")
+    placeholder_rows = [
+        {
+            "id": pid,
+            "name": f"Unknown ({pid})",
+            "first_name": None, "last_name": None,
+            "hand": None, "dob": None, "country_code": None,
+            "height_cm": None, "sackmann_id": safe_int(pid),
+            "is_active": False,
+        }
+        for pid in missing_ids
+    ]
+
     rows_to_insert: list[dict] = []
     for _, row in players_df.iterrows():
         stats["processed"] += 1
@@ -119,6 +137,7 @@ async def sync_players(db: AsyncSession) -> dict:
         stats["inserted"] += 1
 
     BATCH = 500
+    # 1) Real players — upsert (overwrite stale data)
     for i in range(0, len(rows_to_insert), BATCH):
         chunk = rows_to_insert[i:i + BATCH]
         ins = pg_insert(Player).values(chunk)
@@ -127,7 +146,13 @@ async def sync_players(db: AsyncSession) -> dict:
             set_={col: getattr(ins.excluded, col) for col in chunk[0] if col != "id"},
         )
         await db.execute(ins)
-    if rows_to_insert:
+    # 2) Placeholder players — insert only if not already present (never overwrite real data)
+    for i in range(0, len(placeholder_rows), BATCH):
+        chunk = placeholder_rows[i:i + BATCH]
+        ins = pg_insert(Player).values(chunk)
+        ins = ins.on_conflict_do_nothing()
+        await db.execute(ins)
+    if rows_to_insert or placeholder_rows:
         await db.commit()
 
     logger.info(f"sync_players: {stats} ({time.time()-started:.1f}s)")
@@ -218,11 +243,21 @@ async def sync_matches(db: AsyncSession, year: int) -> dict:
     async def _flush_matches(rows: list[dict]) -> None:
         if not rows:
             return
-        stmt = pg_insert(Match).values(rows)
+        # Deduplicate by the unique constraint key to prevent CardinalityViolationError
+        seen: set = set()
+        deduped = []
+        for r in rows:
+            key = (r["tournament_id"], r["round"], r["winner_id"], r["loser_id"])
+            if key not in seen:
+                seen.add(key)
+                deduped.append(r)
+        if not deduped:
+            return
+        stmt = pg_insert(Match).values(deduped)
         skip = {"id", "tournament_id", "round", "winner_id", "loser_id"}
         stmt = stmt.on_conflict_do_update(
             index_elements=["tournament_id", "round", "winner_id", "loser_id"],
-            set_={k: getattr(stmt.excluded, k) for k in rows[0] if k not in skip},
+            set_={k: getattr(stmt.excluded, k) for k in deduped[0] if k not in skip},
         )
         await db.execute(stmt)
         await db.commit()
