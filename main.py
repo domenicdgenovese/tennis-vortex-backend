@@ -137,8 +137,11 @@ async def get_sync_logs(limit: int = 50):
 
 
 @app.post("/api/admin/sync")
-async def trigger_sync(job: str = "full"):
-    """Admin: manually trigger a sync job."""
+async def trigger_sync(job: str = "full", wait: bool = False):
+    """Admin: manually trigger a sync job.
+    Pass ?wait=true to run inline and return the result (useful for debugging).
+    Default is fire-and-forget (background task) for long-running jobs.
+    """
     from database.connection import AsyncSessionLocal
 
     job_map = {
@@ -153,17 +156,24 @@ async def trigger_sync(job: str = "full"):
         return JSONResponse(status_code=400, content={"error": f"Unknown job: {job}. Valid: {list(job_map.keys())}"})
 
     import asyncio
+    import importlib
 
     async def _run():
         module, fn = job_map[job].rsplit(".", 1)
-        import importlib
         mod = importlib.import_module(module)
         fn_obj = getattr(mod, fn)
         async with AsyncSessionLocal() as db:
             return await fn_obj(db)
 
-    asyncio.create_task(_run())
-    return {"message": f"Sync job '{job}' triggered", "status": "running"}
+    if wait:
+        try:
+            result = await _run()
+            return {"message": f"Sync job '{job}' completed", "status": "success", "result": result}
+        except Exception as e:
+            return JSONResponse(status_code=500, content={"error": str(e), "status": "failed"})
+    else:
+        asyncio.create_task(_run())
+        return {"message": f"Sync job '{job}' triggered", "status": "running"}
 
 
 @app.get("/api/scheduler/jobs")
