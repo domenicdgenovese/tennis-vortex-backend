@@ -97,7 +97,8 @@ async def sync_espn_rankings(db: AsyncSession) -> dict:
             parts = display_name.rsplit(" ", 1)
             first = parts[0] if len(parts) == 2 else ""
             last = parts[-1]
-            country_abbr = athlete.get("flag", {}).get("alt") or athlete.get("citizenship", "")
+            country_abbr = athlete.get("citizenshipCountry", "") or ""
+            headshot = athlete.get("headshot", "") or ""
             new_player = {
                 "id": player_id,
                 "name": display_name,
@@ -105,6 +106,7 @@ async def sync_espn_rankings(db: AsyncSession) -> dict:
                 "last_name": last,
                 "country_code": country_abbr[:3].upper() if country_abbr else None,
                 "atp_code": f"e{espn_id}",   # mark as ESPN-sourced
+                "photo_url": headshot or None,
                 "is_active": True,
             }
             p_stmt = pg_insert(Player).values(**new_player)
@@ -117,11 +119,16 @@ async def sync_espn_rankings(db: AsyncSession) -> dict:
             name_to_id[_norm_name(display_name)] = player_id
             espn_id_to_id[espn_id] = player_id
         else:
-            # Update atp_code to store ESPN id for future fast lookups
+            # Update ESPN id + headshot + country for matched players
+            country_abbr = athlete.get("citizenshipCountry", "") or ""
+            headshot = athlete.get("headshot", "") or ""
+            upd: dict = {"atp_code": f"e{espn_id}", "is_active": True}
+            if headshot:
+                upd["photo_url"] = headshot
+            if country_abbr:
+                upd["country_code"] = country_abbr[:3].upper()
             await db.execute(
-                sa_update(Player)
-                .where(Player.id == player_id)
-                .values(atp_code=f"e{espn_id}", is_active=True)
+                sa_update(Player).where(Player.id == player_id).values(**upd)
             )
 
         rows_to_insert.append({
