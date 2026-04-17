@@ -131,7 +131,7 @@ async def get_player_stats(player_id: str, db: AsyncSession = Depends(get_db)):
     # Break points saved ≈ sgw * 0.77 (validated against REAL_STATS calibration set)
     bps = round(max(50.0, min(82.0, sgw * 0.77)), 1)
 
-    # ── YTD match history ────────────────────────────────────────────────────
+    # ── YTD match history (current year) ────────────────────────────────────
     ytd_res = await db.execute(
         select(Match).where(
             and_(
@@ -152,13 +152,26 @@ async def get_player_stats(player_id: str, db: AsyncSession = Depends(get_db)):
         if m.winner_id == player_id and (m.round or "").upper() == "F"
     )
 
+    # ── Recent match history — fall back across years if no current-year data ─
+    # Always show the 10 most recent matches we have, regardless of year.
+    recent_res = await db.execute(
+        select(Match).where(
+            and_(
+                (Match.winner_id == player_id) | (Match.loser_id == player_id),
+                Match.status == "completed",
+            )
+        ).order_by(desc(Match.match_date)).limit(80)
+    )
+    recent_matches = recent_res.scalars().all()
+
     # Form string from last 10 completed matches (most-recent first)
-    last10_m = ytd_matches[:10]
+    last10_m = (ytd_matches or recent_matches)[:10]
     form_str = "".join("W" if m.winner_id == player_id else "L" for m in last10_m) or "WWWWWLWWWW"
 
     # Fatigue = matches played in last 14 days
     cutoff = today - timedelta(days=14)
-    fatigue = sum(1 for m in ytd_matches if m.match_date and m.match_date >= cutoff)
+    all_recent = ytd_matches or recent_matches
+    fatigue = sum(1 for m in all_recent if m.match_date and m.match_date >= cutoff)
 
     # Tournament short-names for last-10 display
     tourn_ids = list({m.tournament_id for m in last10_m if m.tournament_id})
