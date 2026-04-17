@@ -41,8 +41,11 @@ async def list_players(q: Optional[str] = None, limit: int = Query(250, le=500),
     if q:
         stmt = stmt.where(Player.name.ilike(f"%{q}%"))
 
+    # Order by rank in SQL so the top-ranked players fill the limit first
+    from sqlalchemy import nullslast
+    stmt = stmt.order_by(nullslast(RankAlias.rank.asc()))
     rows = (await db.execute(stmt.limit(limit))).all()
-    out = [
+    return [
         {
             "id": p.id, "name": p.name, "country": p.country_code,
             "iso": iso(p.country_code), "hand": p.hand,
@@ -51,8 +54,6 @@ async def list_players(q: Optional[str] = None, limit: int = Query(250, le=500),
         }
         for p, r in rows
     ]
-    out.sort(key=lambda x: (x["rank"] or 9999))
-    return out
 
 @router.get("/{player_id}/stats")
 async def get_player_stats(player_id: str, db: AsyncSession = Depends(get_db)):
